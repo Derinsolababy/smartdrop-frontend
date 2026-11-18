@@ -11,6 +11,11 @@
 /** 5 MiB — far above any legitimate JSON payload this app requests. */
 export const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
 
+/** Fetch wrapper with AbortController support for request cancellation (#748). */
+export async function safeFetch(url: string, options?: { signal?: AbortSignal }) {
+  return fetch(url, { signal: options?.signal });
+}
+
 export class ResponseTooLargeError extends Error {
   constructor(maxBytes: number, declaredBytes?: number) {
     super(
