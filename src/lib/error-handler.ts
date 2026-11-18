@@ -29,7 +29,7 @@ export abstract class SmartDropError extends Error {
     this.originalError = originalError;
 
     // Maintain proper prototype chain for instanceof checks
-    Object.setPrototypeOf(this, SmartDropError.prototype);
+    Object.setPrototypeOf(this, new.target.prototype);
   }
 
   /**
