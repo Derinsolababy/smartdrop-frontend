@@ -23,6 +23,14 @@ export const QUERY_KEYS = {
   BOOST_CONFIG: 'boostConfig',
 } as const;
 
+// Shared cache-staleness buckets (#669) so hooks over the same class of data
+// refresh on the same cadence.
+export const STALE_TIME = {
+  POOLS: 30_000,
+  USER_DATA: 15_000,
+  STATS: 60_000,
+} as const;
+
 /**
  * Hook to fetch all available farming pools
  */
@@ -30,7 +38,7 @@ export const usePools = () => {
   return useQuery({
     queryKey: [QUERY_KEYS.POOLS],
     queryFn: async () => (await loadSoroban()).sorobanService.getFactoryPools(),
-    staleTime: 30000, // 30 seconds
+    staleTime: STALE_TIME.POOLS,
     gcTime: 5 * 60 * 1000, // 5 minutes
     refetchInterval: 60000, // 1 minute
     retry: 3,
@@ -49,7 +57,7 @@ export const usePoolDepositors = (poolId: string, limit: number = 20) => {
     queryKey: ['poolDepositors', poolId, limit],
     queryFn: async () => (await loadSoroban()).sorobanService.getPoolDepositors(poolId, limit),
     enabled: !!poolId,
-    staleTime: 30000,
+    staleTime: STALE_TIME.POOLS,
     gcTime: 5 * 60 * 1000,
     refetchInterval: 60000,
     retry: 2,
@@ -66,7 +74,7 @@ export const useUserPosition = (poolId: string, enabled: boolean = true) => {
     queryKey: [QUERY_KEYS.USER_POSITION, poolId, publicKey],
     queryFn: async () => (await loadSoroban()).sorobanService.getUserPosition(poolId, publicKey!),
     enabled: enabled && !!publicKey && !!poolId,
-    staleTime: 15000, // 15 seconds
+    staleTime: STALE_TIME.USER_DATA,
     gcTime: 5 * 60 * 1000,
     refetchInterval: 30000, // 30 seconds
     retry: 2,
@@ -83,7 +91,7 @@ export const useUserCredits = (poolId: string, enabled: boolean = true) => {
     queryKey: [QUERY_KEYS.USER_CREDITS, poolId, publicKey],
     queryFn: async () => (await loadSoroban()).sorobanService.calculateUserCredits(poolId, publicKey!),
     enabled: enabled && !!publicKey && !!poolId,
-    staleTime: 5000, // 5 seconds (credits change frequently)
+    staleTime: STALE_TIME.USER_DATA,
     gcTime: 5 * 60 * 1000,
     refetchInterval: 10000, // 10 seconds
     retry: 2,
@@ -95,7 +103,7 @@ export const useStellarBalance = (publicKey?: string) => {
     queryKey: ['stellarBalance', publicKey],
     queryFn: async ({ signal }) => (await loadSoroban()).getStellarBalance(publicKey!, signal),
     enabled: !!publicKey,
-    staleTime: 15000,
+    staleTime: STALE_TIME.USER_DATA,
     gcTime: 5 * 60 * 1000,
     retry: 2,
   });
@@ -526,7 +534,7 @@ export const useAllUserPositions = () => {
         .filter(item => item.position !== null);
     },
     enabled: !!publicKey && !!pools && pools.length > 0,
-    staleTime: 15000,
+    staleTime: STALE_TIME.USER_DATA,
     gcTime: 5 * 60 * 1000,
     refetchInterval: 30000,
   });
@@ -559,7 +567,7 @@ export const useTotalUserCredits = () => {
       return totalCredits.toString();
     },
     enabled: !!publicKey && !!pools && pools.length > 0,
-    staleTime: 10000,
+    staleTime: STALE_TIME.USER_DATA,
     gcTime: 5 * 60 * 1000,
     refetchInterval: 15000,
   });
@@ -638,7 +646,7 @@ export function usePlatformStats(initialData?: UIPlatformStats) {
         onlineUsers: stats.onlineUsers,
       };
     },
-    staleTime: 60000,        // Keeps data fresh for 1 minute
+    staleTime: STALE_TIME.STATS,   // Keeps data fresh for 1 minute
     gcTime: 5 * 60 * 1000,
     refetchInterval: 120000, // Re-checks the blockchain automatically every 2 minutes
     initialData: initialData
