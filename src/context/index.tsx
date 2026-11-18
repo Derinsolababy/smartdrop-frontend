@@ -17,21 +17,32 @@ declare global {
 
 function ContextProvider({ children }: { children: ReactNode }) {
   const [queryClient] = useState(() => {
-    return new QueryClient();
+    return new QueryClient({
+      // Baseline caching defaults (issue #481). Every query now inherits a
+      // sane staleTime/gcTime instead of React Query's staleTime: 0 — hooks
+      // that need a different freshness window (5s/15s/60s) still override
+      // these per-query in useSorobanQuery.ts.
+      defaultOptions: {
+        queries: {
+          staleTime: 30_000,
+          gcTime: 5 * 60 * 1000,
+        },
+      },
+    });
   });
 
   useEffect(() => {
-    if (
-      typeof window !== 'undefined' &&
-      (process.env.NODE_ENV !== 'production' || process.env.NEXT_PUBLIC_E2E === 'true')
-    ) {
+    // Dev-only escape hatch for local debugging and Playwright specs that run
+    // `next dev` (NODE_ENV=development). Never expose the QueryClient in a
+    // production bundle — not even when NEXT_PUBLIC_E2E is set (issue #471).
+    if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
       window.__queryClient = queryClient;
     }
   }, [queryClient]);
 
   return (
     <ChakraProvider theme={theme} colorModeManager={localStorageManager}>
-      <ErrorBoundary>
+      <ErrorBoundary captureUnhandledRejections>
         <ErrorProvider>
           <QueryClientProvider client={queryClient}>
             <StellarWalletProvider>{children}</StellarWalletProvider>

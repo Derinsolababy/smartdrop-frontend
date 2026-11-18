@@ -1,7 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import NextLink from "next/link";
+import TransactionConfirmModal from "@/components/TransactionConfirmModal/TransactionConfirmModal";
+import FieldError from "@/components/FieldError/FieldError";
 import {
   Alert,
   AlertIcon,
@@ -15,7 +17,6 @@ import {
   ModalHeader,
   ModalOverlay,
   Skeleton,
-  SkeletonText,
   Spinner,
   Table,
   Tbody,
@@ -33,6 +34,7 @@ import { useLockFlow } from "@/hooks/useLockFlow";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   usePoolDepositors,
+  useLockAssetsFeePreview,
   usePools,
   useStellarBalance,
   useUserCredits,
@@ -80,13 +82,13 @@ function StatCard({
       <Text fontSize="xs" color="app.muted" fontWeight="medium">
         {label}
       </Text>
-      {loading ? (
-        <Skeleton height="24px" w="80%" borderRadius="md" startColor="app.border" endColor="app.surfaceHover" />
-      ) : (
+      {/* Wrapping the real Text (rather than a fixed-height bar) sizes the
+          skeleton to the value's actual line box, so nothing shifts on load. */}
+      <Skeleton isLoaded={!loading} w={loading ? "80%" : undefined} borderRadius="md" startColor="app.border" endColor="app.surfaceHover">
         <Text fontWeight="bold" fontSize="lg" color="app.text">
           {value}
         </Text>
-      )}
+      </Skeleton>
     </Flex>
   );
 }
@@ -208,7 +210,17 @@ export default function PoolDetailClient({ poolId }: { poolId: string }) {
 
   const displayAmount = parseFloat(rawAmount);
   const amountValid = Number.isFinite(displayAmount) && displayAmount > 0;
+  const amountError =
+    rawAmount !== "0" && rawAmount !== "" && !amountValid
+      ? "Enter an amount greater than 0."
+      : null;
+  const amountErrorId = useId();
   const isPending = isDepositPending(flow.step);
+  const lockPeriodLabel = pool
+    ? pool.minLockPeriod >= 86400
+      ? `${Math.floor(pool.minLockPeriod / 86400)} day${Math.floor(pool.minLockPeriod / 86400) > 1 ? "s" : ""}`
+      : `${Math.floor(pool.minLockPeriod / 3600)} hour${Math.floor(pool.minLockPeriod / 3600) > 1 ? "s" : ""}`
+    : "";
 
   if (error) {
     return (
@@ -251,9 +263,7 @@ export default function PoolDetailClient({ poolId }: { poolId: string }) {
 
       {/* Header */}
       <Flex w="full" justify="space-between" align="center" flexWrap="wrap" gap={4}>
-        {poolLoading ? (
-          <Skeleton height="40px" w="200px" borderRadius="xl" startColor="app.border" endColor="app.surfaceHover" />
-        ) : (
+        <Skeleton isLoaded={!poolLoading} w={poolLoading ? "200px" : undefined} borderRadius="xl" startColor="app.border" endColor="app.surfaceHover">
           <Text
             fontSize={{ base: "2xl", md: "3xl" }}
             fontWeight="extrabold"
@@ -261,9 +271,9 @@ export default function PoolDetailClient({ poolId }: { poolId: string }) {
             bgGradient="linear(to-r, app.text, app.accent)"
             bgClip="text"
           >
-            {pool?.asset.code ?? "Pool"} Pool
+            {poolLoading ? "Pool" : `${pool?.asset.code ?? "Pool"} Pool`}
           </Text>
-        )}
+        </Skeleton>
         <Flex align="center" gap={2}>
           {!poolLoading && (
             <ShareButton
@@ -323,10 +333,12 @@ export default function PoolDetailClient({ poolId }: { poolId: string }) {
             Your Earnings
           </Text>
           {creditsLoading || positionLoading ? (
-            <Flex direction="column" gap={2}>
-              {Array.from({ length: 3 }).map((_, i) => (
-                <Skeleton key={i} height="40px" borderRadius="md" />
-              ))}
+            // Same row of StatCards as the loaded state, so the section
+            // keeps its height and layout when earnings arrive.
+            <Flex gap={3} flexWrap="wrap">
+              <StatCard label="Daily Earnings" value="—" loading />
+              <StatCard label="Weekly Earnings" value="—" loading />
+              <StatCard label="Total Earnings" value="—" loading />
             </Flex>
           ) : userCredits ? (
             <Flex gap={3} flexWrap="wrap">
@@ -375,13 +387,7 @@ export default function PoolDetailClient({ poolId }: { poolId: string }) {
         <Text fontSize="sm" fontWeight="semibold" mb={4} color="app.muted" letterSpacing="wide" textTransform="uppercase">
           Top 20 Depositors
         </Text>
-        {depositorsLoading ? (
-          <Flex direction="column" gap={2}>
-            {Array.from({ length: 5 }).map((_, i) => (
-              <SkeletonText key={i} noOfLines={1} skeletonHeight="32px" borderRadius="md" />
-            ))}
-          </Flex>
-        ) : depositors.length === 0 ? (
+        {!depositorsLoading && depositors.length === 0 ? (
           <Text color="app.muted" fontSize="sm">
             No depositors yet.
           </Text>
@@ -397,7 +403,17 @@ export default function PoolDetailClient({ poolId }: { poolId: string }) {
                 </Tr>
               </Thead>
               <Tbody>
-                {depositors.map((d, i) => (
+                {/* Skeleton rows reuse the real table's cells (and its
+                    sm row height) so the list doesn't jump on load. */}
+                {depositorsLoading && Array.from({ length: 5 }).map((_, i) => (
+                  <Tr key={i}>
+                    <Td borderColor="app.border"><Skeleton h="16px" w="16px" borderRadius="md" /></Td>
+                    <Td borderColor="app.border"><Skeleton h="16px" w="88px" borderRadius="md" /></Td>
+                    <Td borderColor="app.border" isNumeric><Skeleton h="16px" w="56px" ml="auto" borderRadius="md" /></Td>
+                    <Td borderColor="app.border" isNumeric><Skeleton h="16px" w="56px" ml="auto" borderRadius="md" /></Td>
+                  </Tr>
+                ))}
+                {!depositorsLoading && depositors.map((d, i) => (
                   <Tr key={d.address} _hover={{ bg: "app.inputBg" }}>
                     <Td borderColor="app.border" color="app.muted">{i + 1}</Td>
                     <Td borderColor="app.border" fontFamily="mono" fontSize="xs">
@@ -435,6 +451,8 @@ export default function PoolDetailClient({ poolId }: { poolId: string }) {
                   value={rawAmount}
                   onChange={(e) => setRawAmount(e.target.value)}
                   isDisabled={isPending}
+                  isInvalid={Boolean(amountError)}
+                  aria-describedby={amountErrorId}
                   borderRadius="2xl"
                   h="50px"
                   borderColor="app.border"
@@ -443,11 +461,7 @@ export default function PoolDetailClient({ poolId }: { poolId: string }) {
                   _hover={{ borderColor: "app.accent" }}
                   _focus={{ boxShadow: "none", borderColor: "app.accent" }}
                 />
-                {rawAmount !== "0" && rawAmount !== "" && !amountValid && (
-                  <Text fontSize="xs" color="#ff8080">
-                    Enter an amount greater than 0.
-                  </Text>
-                )}
+                <FieldError id={amountErrorId} message={amountError} />
               </Flex>
 
               {isPending && (
@@ -507,50 +521,6 @@ export default function PoolDetailClient({ poolId }: { poolId: string }) {
                 )}
               </Button>
 
-              {showConfirmation && (
-                <Alert status="warning" borderRadius="2xl" bg="app.warningBg" color="app.warningFg" fontSize="sm" p={4}>
-                  <Flex direction="column" gap={3} w="full">
-                    <Flex align="flex-start" gap={2}>
-                      <AlertIcon color="app.warningFg" mt={0.5} />
-                      <Box flex="1">
-                        <Text fontWeight="semibold" mb={1}>
-                          Confirm Lock Transaction
-                        </Text>
-                        <Text fontSize="xs">
-                          You are about to lock {displayAmount} {pool?.asset.code ?? ""} for a minimum period of{" "}
-                          {pool
-                            ? pool.minLockPeriod >= 86400
-                              ? `${Math.floor(pool.minLockPeriod / 86400)} day${Math.floor(pool.minLockPeriod / 86400) > 1 ? "s" : ""}`
-                              : `${Math.floor(pool.minLockPeriod / 3600)} hour${Math.floor(pool.minLockPeriod / 3600) > 1 ? "s" : ""}`
-                            : ""}
-                          . This action cannot be reversed until the lock period expires.
-                        </Text>
-                      </Box>
-                    </Flex>
-                    <Flex gap={2} justify="flex-end">
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={handleCancelLock}
-                        isDisabled={isPending}
-                      >
-                        Cancel
-                      </Button>
-                      <Button
-                        size="sm"
-                        bg="app.accent"
-                        color="app.onAccent"
-                        _hover={{ opacity: 0.9 }}
-                        onClick={handleConfirmLock}
-                        isDisabled={isPending}
-                      >
-                        Confirm Lock
-                      </Button>
-                    </Flex>
-                  </Flex>
-                </Alert>
-              )}
-
               {flow.step === "error" && (
                 <Button variant="ghost" size="sm" color="app.muted" onClick={flow.reset}>
                   Try again
@@ -559,6 +529,26 @@ export default function PoolDetailClient({ poolId }: { poolId: string }) {
             </Flex>
           </ModalBody>
         </ModalContent>
+        <TransactionConfirmModal
+          isOpen={showConfirmation}
+          onClose={handleCancelLock}
+          onConfirm={handleConfirmLock}
+          title="Confirm Lock"
+          description="Review the details below. You'll be asked to sign this transaction in Freighter."
+          details={[
+            { label: "Pool", value: pool?.asset.code ?? poolId },
+            { label: "Lock amount", value: `${displayAmount} ${pool?.asset.code ?? ""}` },
+            { label: "Minimum lock period", value: lockPeriodLabel },
+          ]}
+          fee={{
+            minResourceFee: feePreview.data?.feePreview,
+            isLoading: feePreview.isFetching,
+            isError: feePreview.isError,
+            isSponsored: isFeeSponsored,
+          }}
+          warning={`This action cannot be reversed until the ${lockPeriodLabel} lock period expires.`}
+          confirmLabel="Confirm Lock"
+        />
       </Modal>
     </Flex>
   );

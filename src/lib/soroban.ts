@@ -26,6 +26,7 @@ import {
 } from '@/config';
 import { ConfigError, FeeBumpError, FreighterError, SecurityError } from './error-handler';
 import { fetchAccountBalances, fetchHorizonAccount } from './stellar';
+import { readJsonWithLimit } from './safe-fetch';
 import {
   bigintToDisplayAmount,
   parsePoolsFromNative,
@@ -395,6 +396,57 @@ export async function simulateUnlockAssets(
 ) {
   const server = rpcOverride ?? rpcServer;
   const transaction = await buildUnlockAssetsTransaction(args, server);
+  const simulation = await server.simulateTransaction(transaction);
+
+  if ('error' in simulation) {
+    throw new Error(`Simulation failed: ${simulation.error}`);
+  }
+
+  return {
+    transaction,
+    simulation,
+    feePreview: String(simulation.minResourceFee ?? '0'),
+  };
+}
+
+export interface BuildSetBoostTransactionArgs {
+  poolContractId: string;
+  publicKey: string;
+  allocationPercentage: number;
+}
+
+/**
+ * Read-only set_boost simulation for a fee preview — no signing, no
+ * submission. Mirrors the transaction SorobanService.setBoost builds.
+ */
+export async function buildSetBoostTransaction(
+  args: BuildSetBoostTransactionArgs,
+  rpcOverride?: LockAssetsRpc,
+) {
+  const server = rpcOverride ?? rpcServer;
+  const account = await server.getAccount(args.publicKey);
+  const contract = new Contract(args.poolContractId);
+  const operation = contract.call(
+    'set_boost',
+    Address.fromString(args.publicKey).toScVal(),
+    nativeToScVal(args.allocationPercentage, { type: 'u32' }),
+  );
+
+  return new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase,
+  })
+    .addOperation(operation)
+    .setTimeout(300)
+    .build();
+}
+
+export async function simulateSetBoost(
+  args: BuildSetBoostTransactionArgs,
+  rpcOverride?: LockAssetsRpc,
+) {
+  const server = rpcOverride ?? rpcServer;
+  const transaction = await buildSetBoostTransaction(args, server);
   const simulation = await server.simulateTransaction(transaction);
 
   if ('error' in simulation) {
@@ -881,6 +933,9 @@ export class SorobanService {
   // the same promise rather than each firing a separate RPC round trip.
   private inflightAccount: Map<string, Promise<Account>> = new Map();
   private static ACCOUNT_CACHE_TTL_MS = 3_000;
+  // Memoized lazy-init promise (issue #451) — see ensureInitialized().
+  private initPromise?: Promise<void>;
+  private factoryWarningLogged = false;
 
   constructor() {
     this.rpcServer = rpcServer;
@@ -974,9 +1029,30 @@ export class SorobanService {
     if (factoryAddress) {
       this.factoryContract = new Contract(factoryAddress);
     }
-    
+
+    // Without a factory there are no pools to load; skip the call instead of
+    // logging a warning on every page load (#487).
+    if (!this.factoryContract) return;
+
     // Load existing pools
     await this.loadPoolContracts();
+  }
+
+  /**
+   * Lazily run `initialize()` on first use instead of at module import
+   * time (issue #451). The promise is memoized so concurrent callers
+   * share a single RPC round trip; a failure clears it so the next call
+   * can retry. `loadPoolContracts` already swallows factory/RPC errors,
+   * so this never rejects in practice.
+   */
+  private ensureInitialized(): Promise<void> {
+    if (!this.initPromise) {
+      this.initPromise = this.initialize().catch((err) => {
+        console.warn('SorobanService lazy initialization failed:', err);
+        this.initPromise = undefined;
+      });
+    }
+    return this.initPromise;
   }
 
   /**
@@ -1000,7 +1076,10 @@ export class SorobanService {
    */
   async getFactoryPools(): Promise<PoolInfo[]> {
     if (!this.factoryContract) {
-      console.warn('Factory contract not initialized; returning empty pool list');
+      if (!this.factoryWarningLogged) {
+        this.factoryWarningLogged = true;
+        console.warn('Factory contract not initialized; returning empty pool list');
+      }
       return [];
     }
 
@@ -1041,6 +1120,7 @@ export class SorobanService {
     poolId: string,
     userAddress: string
   ): Promise<UserPosition | null> {
+    await this.ensureInitialized();
     const poolContract = this.poolContracts.get(poolId);
     if (!poolContract) {
       console.warn(`Pool contract not found for ID: ${poolId}`);
@@ -1087,6 +1167,7 @@ export class SorobanService {
     poolId: string,
     userAddress: string
   ): Promise<string> {
+    await this.ensureInitialized();
     const poolContract = this.poolContracts.get(poolId);
     if (!poolContract) {
       console.warn(`Pool contract not found for ID: ${poolId}`);
@@ -1323,7 +1404,10 @@ export class SorobanService {
 
   /**
    * Unlock assets from a pool
-   * @param amount - integer stroops as a string (already converted from display units by callers)
+   * @param amount - display units as a string, converted to stroops via
+   *   amountToStroops — the same contract lockAssets uses (issue #445)
+   * @param amountStroops - optional pre-converted stroops value to avoid
+   *   double-conversion when caller has already validated (issue #500)
    */
   async unlockAssets(
     poolId: string,
@@ -1332,6 +1416,7 @@ export class SorobanService {
     walletApi: FreighterWalletApi,
     callbacks?: UnlockAssetsCallbacks,
     isStillConnected?: () => boolean,
+    amountStroops?: bigint,
   ): Promise<TransactionResult> {
     const poolContract = this.resolvePoolContract(poolId);
 
@@ -1354,10 +1439,12 @@ export class SorobanService {
 
       callbacks?.onStep?.('simulating');
 
+      const stroops = amountStroops ?? amountToStroops(amount);
+
       const call = poolContract.call(
         "unlock_assets",
         Address.fromString(userAddress).toScVal(),
-        nativeToScVal(BigInt(amount), { type: "i128" }),
+        nativeToScVal(stroops, { type: "i128" }),
       );
 
       const account = await this.rpcServer.getAccount(userAddress);
@@ -1663,11 +1750,20 @@ export class SorobanService {
       const dailyMap = new Map<string, number>();
       let runningTvl = 0;
 
-      // Seed today and past N days so chart always has points
+      // Seed today and past N days so chart always has points. Use pure UTC
+      // day arithmetic (Date.UTC + millisecond math) rather than
+      // getDate()/setDate(), which operate in the server process's local
+      // timezone: on a "spring forward" DST transition day, subtracting a
+      // local calendar day can skip 23 hours instead of 24, producing a
+      // duplicate key here (collapsing two distinct days into one, since
+      // dailyMap is keyed by date string) — a real, verified gap in the
+      // chart. dateKey below is already a pure UTC slice of ledgerClosedAt,
+      // so seeding needs to match that exactly, with no DST dependency.
+      const now = new Date();
+      const todayUtcMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+      const MS_PER_DAY = 24 * 60 * 60 * 1000;
       for (let i = days - 1; i >= 0; i--) {
-        const d = new Date();
-        d.setDate(d.getDate() - i);
-        dailyMap.set(d.toISOString().slice(0, 10), 0);
+        dailyMap.set(new Date(todayUtcMs - i * MS_PER_DAY).toISOString().slice(0, 10), 0);
       }
 
       for (const evt of events) {
@@ -1801,10 +1897,10 @@ export class SorobanService {
     const res = await fetch(url.toString(), { headers: { accept: 'application/json' } });
     if (!res.ok) throw new Error(`Leaderboard API responded ${res.status}`);
 
-    const data = (await res.json()) as {
+    const data = await readJsonWithLimit<{
       entries?: Array<Partial<LeaderboardRow>>;
       total?: number;
-    };
+    }>(res);
     const entries: LeaderboardRow[] = (data.entries ?? []).map((e) => ({
       address: String(e.address ?? ''),
       totalCredits: Number(e.totalCredits ?? 0),
@@ -1951,51 +2047,85 @@ export class SorobanService {
     return parseCreditsFromXdrResult(xdrResult);
   }
 
-  async getCreditVelocity(_windowHours: number = 24): Promise<string> {
+  /**
+   * Credits accrued across pools over the trailing `windowHours` window
+   * (issue #446).
+   *
+   * Instead of simulating `get_total_credits` on every pool (an all-time
+   * snapshot that ignored the window entirely), this scans `update_credits`
+   * events bounded by `windowHours` — plus an equal pre-window period used
+   * as a per-address baseline — and sums each address's net credit growth.
+   * Returns "0" when no factory is configured or no growth was observed.
+   */
+  async getCreditVelocity(windowHours: number = 24): Promise<string> {
     try {
       if (!this.factoryContract) {
         return "0";
       }
 
-      const pools = await this.getFactoryPools();
-      if (!pools || pools.length === 0) {
+      const poolIds = await this.getLeaderboardPoolIds();
+      if (poolIds.length === 0) {
         return "0";
       }
 
-      let totalVelocity = 0n;
-      for (const pool of pools) {
-        const poolContract = this.poolContracts.get(pool.id);
-        if (!poolContract) {
-          this.poolContracts.set(pool.id, new Contract(pool.contractAddress));
-        }
+      // ~5s per ledger. Scan the window plus an equal baseline period so
+      // addresses that last updated before the window still have a starting
+      // value to diff against.
+      const hours = Number.isFinite(windowHours) && windowHours > 0 ? windowHours : 24;
+      const ledgersPerWindow = Math.max(1, Math.ceil((hours * 3600) / 5));
+      const latest = await this.rpcServer.getLatestLedger();
+      const startLedger = Math.max(1, latest.sequence - ledgersPerWindow * 2);
+      const windowStartMs = Date.now() - hours * 3600 * 1000;
 
-        const resolvedContract = this.poolContracts.get(pool.id) || new Contract(pool.contractAddress);
-        const call = resolvedContract.call("get_total_credits");
+      const creditSym = xdr.ScVal.scvSymbol('update_credits').toXDR('base64');
+      const { events, truncated } = await getAllEvents(this.rpcServer, {
+        startLedger,
+        endLedger: latest.sequence,
+        filters: [
+          {
+            type: 'contract',
+            contractIds: poolIds,
+            topics: [[creditSym, '*']],
+          },
+        ],
+        limit: 1000,
+      });
 
-        const account = await this.getSimulationAccount();
-        const transaction = new TransactionBuilder(account, {
-          fee: BASE_FEE,
-          networkPassphrase,
-        })
-          .addOperation(call)
-          .setTimeout(30)
-          .build();
+      if (truncated) {
+        console.warn('[SmartDrop] getCreditVelocity: event results were truncated — velocity may be understated');
+      }
 
-        try {
-          const simulation = await this.rpcServer.simulateTransaction(transaction);
-          if (!("error" in simulation) && simulation.result?.retval) {
-            const { scValToNative } = await import('@stellar/stellar-sdk');
-            const value = scValToNative(simulation.result.retval);
-            if (typeof value === 'bigint') {
-              totalVelocity += value;
-            }
-          }
-        } catch {
-          continue;
+      // Per address: last value observed before the window opened, plus the
+      // first and last values observed inside it.
+      const baseline = new Map<string, number>();
+      const firstInWindow = new Map<string, number>();
+      const lastInWindow = new Map<string, number>();
+
+      for (const evt of events) {
+        if (!evt.inSuccessfulContractCall) continue;
+        const topics = (evt.topic as xdr.ScVal[]).map(scValToNative);
+        const action = topics[0] as string;
+        if (action !== 'update_credits') continue;
+        const address = String(topics[1] ?? '');
+        if (!address) continue;
+
+        const value = this.extractEventAmount(scValToNative(evt.value as xdr.ScVal));
+        const closedAt = Date.parse(evt.ledgerClosedAt);
+        if (closedAt < windowStartMs) {
+          baseline.set(address, value);
+        } else {
+          if (!firstInWindow.has(address)) firstInWindow.set(address, value);
+          lastInWindow.set(address, value);
         }
       }
 
-      return totalVelocity.toString();
+      let total = 0;
+      for (const [address, last] of lastInWindow) {
+        const start = baseline.get(address) ?? firstInWindow.get(address) ?? 0;
+        total += Math.max(0, last - start);
+      }
+
+      return String(Math.round(total));
     } catch (error) {
       console.error("Failed to calculate credit velocity:", error);
       return "0";
@@ -2003,11 +2133,12 @@ export class SorobanService {
   }
 }
 
-// Export singleton instance
+// Export singleton instance.
+// NOTE: do NOT call initialize() here — a module-level RPC call runs at
+// import time (issue #451), which breaks tree-shaking, fails when the RPC
+// is unavailable during import, and surprises tests that only import this
+// module. Pool contracts are loaded lazily on first use instead.
 export const sorobanService = new SorobanService();
-
-// Initialize on import
-sorobanService.initialize();
 
 // Utility functions
 export const formatCredits = (credits: string): string => {
@@ -2038,6 +2169,11 @@ export const formatCredits = (credits: string): string => {
   return Number(formattedCredits) === 0 ? normalizedCredits : formattedCredits;
 };
 
+// #496 — one number formatter for the lock-time and asset-amount helpers, with
+// a fixed locale so both format numbers the same way for every user.
+const NUMBER_FORMAT = new Intl.NumberFormat('en-US', { maximumFractionDigits: 7 });
+const formatNumber = (value: number): string => NUMBER_FORMAT.format(value);
+
 export const formatLockTime = (timestamp: number): string => {
   const now = Date.now();
   const diff = timestamp - now;
@@ -2050,9 +2186,9 @@ export const formatLockTime = (timestamp: number): string => {
   const days = Math.floor(hours / 24);
   
   if (days > 0) {
-    return `${days} day${days > 1 ? 's' : ''} remaining`;
+    return `${formatNumber(days)} day${days > 1 ? 's' : ''} remaining`;
   } else if (hours > 0) {
-    return `${hours} hour${hours > 1 ? 's' : ''} remaining`;
+    return `${formatNumber(hours)} hour${hours > 1 ? 's' : ''} remaining`;
   } else {
     return 'Less than 1 hour';
   }
@@ -2060,7 +2196,7 @@ export const formatLockTime = (timestamp: number): string => {
 
 export const formatAssetAmount = (amount: string, asset: AssetInfo): string => {
   const num = parseFloat(amount);
-  return `${num.toLocaleString()} ${asset.code}`;
+  return `${formatNumber(num)} ${asset.code}`;
 };
 
 /** Convenience wrapper — call lock_assets on a pool and await on-chain confirmation. */
@@ -2099,18 +2235,20 @@ export const unlockAssets = async ({
   walletApi: FreighterWalletApi;
   isStillConnected?: () => boolean;
 } & UnlockAssetsCallbacks) => {
-  // Convert display-unit amount to integer stroops using the same validated
-  // helper lockAssets relies on (rejects malformed/decimal-precision input
-  // with a clear error instead of a raw NaN or BigInt() crash).
-  const stroops = amountToStroops(amount).toString();
-  return sorobanService.unlockAssets(poolContractId, publicKey, stroops, walletApi, {
+  // Validate the display-unit amount up front so malformed input is rejected
+  // before any wallet/RPC interaction. Capture the converted stroops value
+  // to avoid double-conversion in the service (issue #500).
+  const stroops = amountToStroops(amount);
+  return sorobanService.unlockAssets(poolContractId, publicKey, amount, walletApi, {
     onHash,
     onStep,
-  }, isStillConnected);
+  }, isStillConnected, stroops);
 };
 
+// Both segments come from RPC/Horizon responses; encode them so a malformed
+// value can't add path segments or a query to the explorer URL (#527).
 export const stellarExpertTxUrl = (hash: string, network: string) =>
-  `https://stellar.expert/explorer/${network}/tx/${hash}`;
+  `https://stellar.expert/explorer/${encodeURIComponent(network)}/tx/${encodeURIComponent(hash)}`;
 
 /**
  * Compute live-preview values for a partial unlock.

@@ -1,10 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import UnlockModal from './UnlockModal';
-import { useFarmStore } from '@/store/farmStore';
+import { useFarmStore, type FarmStore } from '@/store/farmStore';
 import { useStellarWallet } from '@/context/StellarWalletContext';
 import { useUnlockAssetsFeePreview } from '@/hooks/useSorobanQuery';
-import { unlockAssets } from '@/lib/soroban';
+import { unlockAssets, type UnlockAssetsCallbacks } from '@/lib/soroban';
 import { useCountdown } from '@/hooks/useCountdown';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ChakraProvider } from '@chakra-ui/react';
@@ -97,23 +97,24 @@ describe('UnlockModal', () => {
     vi.clearAllMocks();
 
     // Default mock implementations
-    vi.mocked(useFarmStore).mockImplementation((selector: (state: Record<string, unknown>) => unknown) => {
+    vi.mocked(useFarmStore).mockImplementation((selector: (state: FarmStore) => unknown) => {
       const state = {
         activeModal: 'unlock',
         selectedPosition: mockPosition,
         close: vi.fn(),
-      };
+      } as unknown as FarmStore;
       return selector(state);
     });
 
     vi.mocked(useStellarWallet).mockReturnValue({
       publicKey: 'G_TEST_USER',
       walletApi: { signTransaction: vi.fn() } as never,
+      networkName: 'TESTNET',
       isNetworkMismatch: false,
       isConnected: true,
       connect: vi.fn(),
       disconnect: vi.fn(),
-    } as ReturnType<typeof useStellarWallet>);
+    } as unknown as ReturnType<typeof useStellarWallet>);
 
     vi.mocked(useUnlockAssetsFeePreview).mockReturnValue({
       data: { feePreview: '100' },
@@ -136,8 +137,12 @@ describe('UnlockModal', () => {
   });
 
   it('does not render modal content when position is null', () => {
-    vi.mocked(useFarmStore).mockImplementation((selector: (state: Record<string, unknown>) => unknown) => {
-      return selector({ activeModal: 'unlock', selectedPosition: null, close: vi.fn() });
+    vi.mocked(useFarmStore).mockImplementation((selector: (state: FarmStore) => unknown) => {
+      return selector({
+        activeModal: 'unlock',
+        selectedPosition: null,
+        close: vi.fn(),
+      } as unknown as FarmStore);
     });
     renderWithProviders(createElement(UnlockModal));
     // Modal should not show Unlock header
@@ -197,13 +202,14 @@ describe('UnlockModal', () => {
   });
 
   it('handles successful unlock flow', async () => {
-    vi.mocked(unlockAssets).mockImplementation(async (args: Record<string, unknown>) => {
-      const onStep = args.onStep as ((s: string) => void) | undefined;
-      const onHash = args.onHash as ((h: string) => void) | undefined;
-      onStep?.('simulating');
-      onStep?.('signing');
-      onStep?.('submitting');
-      onHash?.('test-hash-abc');
+    vi.mocked(unlockAssets).mockImplementation(async (args: {
+      onStep?: UnlockAssetsCallbacks['onStep'];
+      onHash?: UnlockAssetsCallbacks['onHash'];
+    }) => {
+      args.onStep?.('simulating');
+      args.onStep?.('signing');
+      args.onStep?.('submitting');
+      args.onHash?.('test-hash-abc');
       return { success: true, hash: 'test-hash-abc', status: 'SUCCESS' };
     });
 
@@ -213,6 +219,7 @@ describe('UnlockModal', () => {
 
     const button = screen.getByRole('button', { name: /Unlock with Freighter/i });
     fireEvent.click(button);
+    fireEvent.click(await screen.findByRole('button', { name: /Confirm Unlock/i }));
 
     // Wait for the modal to show success state — the Badge text
     await waitFor(() => {
@@ -225,14 +232,15 @@ describe('UnlockModal', () => {
   });
 
   it('handles unlock error flow — result.success === false', async () => {
-    vi.mocked(unlockAssets).mockImplementation(async (args: Record<string, unknown>) => {
-      const onStep = args.onStep as ((s: string) => void) | undefined;
-      onStep?.('simulating');
+    vi.mocked(unlockAssets).mockImplementation(async (args: {
+      onStep?: UnlockAssetsCallbacks['onStep'];
+    }) => {
+      args.onStep?.('simulating');
       return {
         success: false,
         status: 'FAILED',
         error: 'Insufficient balance to cover this transaction. Please ensure your wallet has enough funds.',
-      };
+      } as Awaited<ReturnType<typeof unlockAssets>>;
     });
 
     renderWithProviders(createElement(UnlockModal));
@@ -241,6 +249,7 @@ describe('UnlockModal', () => {
 
     const button = screen.getByRole('button', { name: /Unlock with Freighter/i });
     fireEvent.click(button);
+    fireEvent.click(await screen.findByRole('button', { name: /Confirm Unlock/i }));
 
     await waitFor(() => {
       expect(screen.getByText(/Insufficient balance/i)).toBeTruthy();
@@ -250,6 +259,76 @@ describe('UnlockModal', () => {
     await waitFor(() => {
       const btn = screen.getByRole('button', { name: /Unlock with Freighter/i });
       expect(btn).toHaveProperty('disabled', false);
+    });
+  });
+
+  it('requires confirmation before submitting the unlock', async () => {
+    renderWithProviders(createElement(UnlockModal));
+    fireEvent.change(screen.getByPlaceholderText('Amount'), { target: { value: '50' } });
+
+    fireEvent.click(screen.getByRole('button', { name: /Unlock with Freighter/i }));
+
+    expect(await screen.findByText('Confirm Unlock', { selector: 'header' })).toBeTruthy();
+    expect(screen.getByText('50 XLM')).toBeTruthy();
+    expect(unlockAssets).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: /^Cancel$/i }));
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: /Confirm Unlock/i })).toBeNull();
+    });
+    expect(unlockAssets).not.toHaveBeenCalled();
+  });
+
+  it('moves focus off a control that becomes disabled when the content changes', async () => {
+    const { rerender } = renderWithProviders(createElement(UnlockModal));
+    const dialog = screen.getByRole('dialog', { name: /Unlock XLM/i });
+    const unlockButton = screen.getByRole('button', { name: /Unlock with Freighter/i });
+    unlockButton.focus();
+    expect(document.activeElement).toBe(unlockButton);
+
+    // Lock period no longer elapsed → the amount controls and action disable
+    // underneath the focused button.
+    vi.mocked(useCountdown).mockReturnValue({
+      isElapsed: false,
+      remainingMs: 50000,
+      label: '1 hour remaining',
+    });
+    rerender(
+      createElement(ChakraProvider, null,
+        createElement(QueryClientProvider, { client: createQueryClient() }, createElement(UnlockModal))
+      )
+    );
+
+    await waitFor(() => {
+      expect(unlockButton).toHaveProperty('disabled', true);
+      expect(document.activeElement).not.toBe(unlockButton);
+      expect(dialog.contains(document.activeElement)).toBe(true);
+    });
+  });
+
+  describe('Escape key (#516)', () => {
+    function mockStore(close: () => void) {
+      vi.mocked(useFarmStore).mockImplementation((selector: (state: FarmStore) => unknown) =>
+        selector({ activeModal: 'unlock', selectedPosition: mockPosition, close } as unknown as FarmStore),
+      );
+    }
+
+    it('closes the modal when Escape is pressed', () => {
+      const close = vi.fn();
+      mockStore(close);
+      renderWithProviders(createElement(UnlockModal));
+      fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape', code: 'Escape' });
+      expect(close).toHaveBeenCalledTimes(1);
+    });
+
+    it('closes on Escape while focus is in the amount input', () => {
+      const close = vi.fn();
+      mockStore(close);
+      renderWithProviders(createElement(UnlockModal));
+      const input = screen.getByRole('dialog').querySelector('input');
+      expect(input).toBeTruthy();
+      fireEvent.keyDown(input!, { key: 'Escape', code: 'Escape' });
+      expect(close).toHaveBeenCalledTimes(1);
     });
   });
 });

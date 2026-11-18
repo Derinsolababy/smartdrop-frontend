@@ -4,17 +4,20 @@ import { Avatar, Box, Flex, Grid, HStack, Link as ChakraLink, Skeleton, Skeleton
 import NextLink from "next/link";
 
 import contributorData from "@/data/contributors.json";
+import { safeHttpUrl } from "@/lib/sanitize";
 
+// Heights mirror the loaded page's line boxes (font size × 1.5 body line
+// height) so swapping in real content doesn't shift the layout.
 function ContributorsSkeleton() {
   return (
     <Flex direction="column" align="center" px={{ base: 6, md: 16 }} py={10} gap={10}>
       <Box w="100%" maxW="1100px">
         <HStack spacing={2} mb={5}>
           <Skeleton w="6px" h="6px" borderRadius="full" />
-          <Skeleton h="12px" w="120px" />
+          <Skeleton h="18px" w="120px" />
         </HStack>
-        <Skeleton h={{ base: "40px", md: "48px" }} w="300px" mb={4} />
-        <Skeleton h="20px" w="400px" />
+        <Skeleton h={{ base: "54px", md: "72px" }} w="300px" mb={4} />
+        <Skeleton h="54px" w="100%" maxW="640px" />
       </Box>
       <Grid
         w="100%"
@@ -34,9 +37,9 @@ function ContributorsSkeleton() {
             bg="app.surface"
           >
             <SkeletonCircle size="48px" flexShrink={0} />
-            <Stack flex={1} spacing={2}>
-              <Skeleton h="16px" w="100px" />
-              <Skeleton h="12px" w="80px" />
+            <Stack flex={1} spacing={0}>
+              <Skeleton h="24px" w="100px" />
+              <Skeleton h="21px" w="80px" />
             </Stack>
           </Flex>
         ))}
@@ -112,7 +115,10 @@ export default function ContributorsPage() {
           <ChakraLink
             key={c.login}
             as={NextLink}
-            href={c.html_url}
+            href={
+              safeHttpUrl(c.html_url, ["github.com"]) ??
+              `https://github.com/${encodeURIComponent(c.login)}`
+            }
             target="_blank"
             rel="noreferrer"
             minW={0}
@@ -131,7 +137,7 @@ export default function ContributorsPage() {
               transition="all 0.2s ease"
               _hover={{ borderColor: "app.borderHover", boxShadow: "cardHover", transform: "translateY(-2px)" }}
             >
-              <Avatar src={c.avatar_url} name={c.login} size="md" flexShrink={0} />
+              <Avatar src={safeHttpUrl(c.avatar_url, ["avatars.githubusercontent.com"])} name={c.login} size="md" flexShrink={0} />
               <Box minW={0} flex={1}>
                 <Text fontWeight="semibold" color="app.text" isTruncated>
                   @{c.login}

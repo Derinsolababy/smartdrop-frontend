@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import {
   Alert,
   AlertIcon,
@@ -28,6 +28,7 @@ import { useStellarWallet } from "@/context/StellarWalletContext";
 import ConnectWalletButton from "@/components/ConnectWalletButton/ConnectWalletButton";
 import LiveRegion from "@/components/LiveRegion/LiveRegion";
 import { useLiveAnnouncer } from "@/hooks/useLiveAnnouncer";
+import { useUrlPagination } from "@/hooks/useUrlPagination";
 import {
   getUserTransactionHistory,
   stellarExpertTxUrl,
@@ -76,7 +77,7 @@ function EmptyState({ children }: { children: React.ReactNode }) {
   );
 }
 
-function HistoryCard({ entry }: { entry: TxHistoryEntry }) {
+const HistoryCard = memo(function HistoryCard({ entry }: { entry: TxHistoryEntry }) {
   return (
     <Box
       w="100%"
@@ -133,7 +134,7 @@ function HistoryCard({ entry }: { entry: TxHistoryEntry }) {
       </VStack>
     </Box>
   );
-}
+});
 
 export default function HistoryPage() {
   // Chakra's `ssr` option is inverted from what the name suggests: `ssr: false`
@@ -151,7 +152,8 @@ export default function HistoryPage() {
   const [entries, setEntries] = useState<TxHistoryEntry[]>([]);
   const [truncated, setTruncated] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
-  const [page, setPage] = useState(1);
+  // Page lives in the URL so history pages can be shared (#593).
+  const { page, setPage } = useUrlPagination();
   const [error, setError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
 
@@ -352,8 +354,8 @@ export default function HistoryPage() {
           )}
 
           {truncated && (
-            <Alert status="warning" borderRadius="2xl" mt={4} bg="#2a2412" color="#f6c453" maxW="1000px" w="full">
-              <AlertIcon color="#f6c453" />
+            <Alert status="warning" borderRadius="2xl" mt={4} bg="app.warningBg" color="app.warningFg" maxW="1000px" w="full">
+              <AlertIcon color="app.warningFg" />
               <Text fontSize="sm">Some history may be missing — the result was truncated. Older transactions may not be shown.</Text>
             </Alert>
           )}

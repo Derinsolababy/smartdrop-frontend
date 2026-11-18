@@ -2,7 +2,7 @@ import { ChakraProvider } from "@chakra-ui/react";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import Navbar from "./Navbar";
+import Navbar, { isActiveRoute } from "./Navbar";
 import { usePlatformStats } from "@/hooks/useSorobanQuery";
 
 const walletMock = vi.hoisted(() => ({
@@ -17,6 +17,7 @@ const walletMock = vi.hoisted(() => ({
 
 vi.mock("@/context/StellarWalletContext", () => ({
   useStellarWallet: vi.fn(() => walletMock),
+  useStellarWalletActions: vi.fn(() => walletMock),
 }));
 
 vi.mock("@/hooks/useSorobanQuery", () => ({
@@ -174,6 +175,34 @@ describe("Navbar active-link highlighting", () => {
   });
 });
 
+describe("isActiveRoute (#547)", () => {
+  it("matches home only on the root path", () => {
+    expect(isActiveRoute("/", "/")).toBe(true);
+    expect(isActiveRoute("/history", "/")).toBe(false);
+  });
+
+  it("matches nested routes and a trailing slash, but not lookalike prefixes", () => {
+    expect(isActiveRoute("/airdrops", "/airdrops")).toBe(true);
+    expect(isActiveRoute("/airdrops/123", "/airdrops")).toBe(true);
+    expect(isActiveRoute("/airdrops/", "/airdrops")).toBe(true);
+    expect(isActiveRoute("/airdropsx", "/airdrops")).toBe(false);
+    expect(isActiveRoute(null, "/airdrops")).toBe(false);
+  });
+});
+
+describe("Navbar active route on nested paths (#547)", () => {
+  it("highlights the section link and sets aria-current on a nested route", () => {
+    usePathnameMock.mockReturnValue("/history/abc");
+    renderNavbar();
+
+    const history = screen.getByRole("link", { name: "History" });
+    const home = screen.getByRole("link", { name: "Home" });
+    expect(history.className).toContain("font-semibold");
+    expect(history.getAttribute("aria-current")).toBe("page");
+    expect(home.getAttribute("aria-current")).toBeNull();
+  });
+});
+
 describe("Navbar mobile drawer (#382)", () => {
   it("auto-closes when the pathname changes, not just on a NavLink click", async () => {
     usePathnameMock.mockReturnValue("/");
@@ -215,5 +244,36 @@ describe("Navbar More menu", () => {
       );
       expect(item.getAttribute("href")).toBe(hrefs[i]);
     }
+  });
+});
+
+describe("Navbar theme toggle (#563)", () => {
+  const currentToggleLabel = () =>
+    screen.getAllByRole("button", { name: /^Switch to (light|dark) mode$/ })[0]
+      .getAttribute("aria-label");
+
+  it("renders a theme toggle that names the mode it switches to", () => {
+    renderNavbar();
+    expect(currentToggleLabel()).toMatch(/^Switch to (light|dark) mode$/);
+  });
+
+  it("clicking the toggle flips the mode and its label", async () => {
+    renderNavbar();
+    const before = currentToggleLabel();
+    fireEvent.click(screen.getAllByRole("button", { name: before! })[0]);
+    await waitFor(() => expect(currentToggleLabel()).not.toBe(before));
+  });
+
+  it("Ctrl+Shift+D flips the mode exactly once with both navbar toggles mounted", async () => {
+    renderNavbar();
+    // Mobile + desktop toggles are both in the DOM.
+    expect(
+      screen.getAllByRole("button", { name: /^Switch to (light|dark) mode$/ }),
+    ).toHaveLength(2);
+    const before = currentToggleLabel();
+
+    fireEvent.keyDown(window, { code: "KeyD", ctrlKey: true, shiftKey: true });
+
+    await waitFor(() => expect(currentToggleLabel()).not.toBe(before));
   });
 });

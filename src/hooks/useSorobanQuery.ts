@@ -5,17 +5,14 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import {
-  getStellarBalance,
-  rpcServer,
-  simulateLockAssets,
-  simulateUnlockAssets,
-  sorobanService,
-  type UserPosition,
-  type TransactionResult,
-} from '@/lib/soroban';
+import type { UserPosition, TransactionResult } from '@/lib/soroban';
 import { useStellarWallet } from '@/context/StellarWalletContext';
 import { useToast } from '@chakra-ui/react';
+
+// #498 — the Soroban service is loaded on first use instead of when this module
+// is imported, so the RPC client is not created during app boot before any
+// query needs it.
+const loadSoroban = () => import('@/lib/soroban');
 
 // Query Keys
 export const QUERY_KEYS = {
@@ -26,14 +23,22 @@ export const QUERY_KEYS = {
   BOOST_CONFIG: 'boostConfig',
 } as const;
 
+// Shared cache-staleness buckets (#669) so hooks over the same class of data
+// refresh on the same cadence.
+export const STALE_TIME = {
+  POOLS: 30_000,
+  USER_DATA: 15_000,
+  STATS: 60_000,
+} as const;
+
 /**
  * Hook to fetch all available farming pools
  */
 export const usePools = () => {
   return useQuery({
     queryKey: [QUERY_KEYS.POOLS],
-    queryFn: () => sorobanService.getFactoryPools(),
-    staleTime: 30000, // 30 seconds
+    queryFn: async () => (await loadSoroban()).sorobanService.getFactoryPools(),
+    staleTime: STALE_TIME.POOLS,
     gcTime: 5 * 60 * 1000, // 5 minutes
     refetchInterval: 60000, // 1 minute
     retry: 3,
@@ -50,9 +55,9 @@ export const usePools = () => {
 export const usePoolDepositors = (poolId: string, limit: number = 20) => {
   return useQuery({
     queryKey: ['poolDepositors', poolId, limit],
-    queryFn: () => sorobanService.getPoolDepositors(poolId, limit),
+    queryFn: async () => (await loadSoroban()).sorobanService.getPoolDepositors(poolId, limit),
     enabled: !!poolId,
-    staleTime: 30000,
+    staleTime: STALE_TIME.POOLS,
     gcTime: 5 * 60 * 1000,
     refetchInterval: 60000,
     retry: 2,
@@ -67,9 +72,9 @@ export const useUserPosition = (poolId: string, enabled: boolean = true) => {
 
   return useQuery({
     queryKey: [QUERY_KEYS.USER_POSITION, poolId, publicKey],
-    queryFn: () => sorobanService.getUserPosition(poolId, publicKey!),
+    queryFn: async () => (await loadSoroban()).sorobanService.getUserPosition(poolId, publicKey!),
     enabled: enabled && !!publicKey && !!poolId,
-    staleTime: 15000, // 15 seconds
+    staleTime: STALE_TIME.USER_DATA,
     gcTime: 5 * 60 * 1000,
     refetchInterval: 30000, // 30 seconds
     retry: 2,
@@ -84,9 +89,9 @@ export const useUserCredits = (poolId: string, enabled: boolean = true) => {
 
   return useQuery({
     queryKey: [QUERY_KEYS.USER_CREDITS, poolId, publicKey],
-    queryFn: () => sorobanService.calculateUserCredits(poolId, publicKey!),
+    queryFn: async () => (await loadSoroban()).sorobanService.calculateUserCredits(poolId, publicKey!),
     enabled: enabled && !!publicKey && !!poolId,
-    staleTime: 5000, // 5 seconds (credits change frequently)
+    staleTime: STALE_TIME.USER_DATA,
     gcTime: 5 * 60 * 1000,
     refetchInterval: 10000, // 10 seconds
     retry: 2,
@@ -96,9 +101,9 @@ export const useUserCredits = (poolId: string, enabled: boolean = true) => {
 export const useStellarBalance = (publicKey?: string) => {
   return useQuery({
     queryKey: ['stellarBalance', publicKey],
-    queryFn: ({ signal }) => getStellarBalance(publicKey!, signal),
+    queryFn: async ({ signal }) => (await loadSoroban()).getStellarBalance(publicKey!, signal),
     enabled: !!publicKey,
-    staleTime: 15000,
+    staleTime: STALE_TIME.USER_DATA,
     gcTime: 5 * 60 * 1000,
     retry: 2,
   });
@@ -152,8 +157,8 @@ export const useLockAssetsFeePreview = (args: {
       args.poolContractId,
       debouncedAmount,
     ],
-    queryFn: () =>
-      simulateLockAssets({
+    queryFn: async () =>
+      (await loadSoroban()).simulateLockAssets({
         publicKey: args.publicKey!,
         poolContractId: args.poolContractId!,
         amount: debouncedAmount,
@@ -203,8 +208,8 @@ export const useUnlockAssetsFeePreview = (args: {
       args.poolContractId,
       debouncedAmount,
     ],
-    queryFn: () =>
-      simulateUnlockAssets({
+    queryFn: async () =>
+      (await loadSoroban()).simulateUnlockAssets({
         publicKey: args.publicKey!,
         poolContractId: args.poolContractId!,
         amount: debouncedAmount,
@@ -215,6 +220,59 @@ export const useUnlockAssetsFeePreview = (args: {
       !!debouncedAmount &&
       Number.isFinite(numericAmount) &&
       numericAmount > 0,
+    staleTime: 10000,
+    gcTime: 5 * 60 * 1000,
+    retry: 1,
+  });
+
+  return { ...query, isFetching: query.isFetching || isDebouncing };
+};
+
+/**
+ * Live, debounced fee preview for set_boost so BoostModal can show the
+ * estimated fee before the Freighter signing prompt. Debounced on the
+ * slider value so dragging doesn't fire a simulation per step.
+ */
+export const useSetBoostFeePreview = (args: {
+  publicKey?: string | null;
+  poolContractId?: string | null;
+  allocationPercentage?: number | null;
+  enabled?: boolean;
+}) => {
+  const allocation = args.allocationPercentage ?? null;
+  const [debouncedAllocation, setDebouncedAllocation] = useState<number | null>(null);
+
+  useEffect(() => {
+    const id = setTimeout(
+      () => setDebouncedAllocation(allocation),
+      LOCK_ASSETS_FEE_PREVIEW_DEBOUNCE_MS,
+    );
+    return () => clearTimeout(id);
+  }, [allocation]);
+
+  const isDebouncing = allocation !== debouncedAllocation;
+
+  const query = useQuery({
+    queryKey: [
+      'setBoostFeePreview',
+      args.publicKey,
+      args.poolContractId,
+      debouncedAllocation,
+    ],
+    queryFn: async () =>
+      (await loadSoroban()).simulateSetBoost({
+        publicKey: args.publicKey!,
+        poolContractId: args.poolContractId!,
+        allocationPercentage: debouncedAllocation!,
+      }),
+    enabled:
+      (args.enabled ?? true) &&
+      !!args.publicKey &&
+      !!args.poolContractId &&
+      debouncedAllocation !== null &&
+      Number.isInteger(debouncedAllocation) &&
+      debouncedAllocation >= 0 &&
+      debouncedAllocation <= 100,
     staleTime: 10000,
     gcTime: 5 * 60 * 1000,
     retry: 1,
@@ -250,6 +308,7 @@ export const useLockAssets = (options?: {
       if (!walletApi || !publicKey) {
         throw new Error('Wallet not connected. Please connect Freighter before depositing.');
       }
+      const { sorobanService } = await loadSoroban();
       const result = await sorobanService.lockAssets(
         poolId,
         publicKey,
@@ -324,6 +383,7 @@ export const useUnlockAssets = () => {
       if (!walletApi || !publicKey) {
         throw new Error('Wallet not connected');
       }
+      const { sorobanService } = await loadSoroban();
       return sorobanService.unlockAssets(
         poolId,
         publicKey,
@@ -404,6 +464,7 @@ export const useSetBoost = () => {
       if (!walletApi || !publicKey) {
         throw new Error('Wallet not connected');
       }
+      const { sorobanService } = await loadSoroban();
       return sorobanService.setBoost(poolId, publicKey, allocationPercentage, walletApi);
     },
     onSuccess: (result: TransactionResult, variables) => {
@@ -460,6 +521,7 @@ export const useAllUserPositions = () => {
     queryFn: async () => {
       if (!publicKey || !pools) return [];
 
+      const { sorobanService } = await loadSoroban();
       const positions = await Promise.allSettled(
         pools.map(pool => sorobanService.getUserPosition(pool.id, publicKey))
       );
@@ -472,7 +534,7 @@ export const useAllUserPositions = () => {
         .filter(item => item.position !== null);
     },
     enabled: !!publicKey && !!pools && pools.length > 0,
-    staleTime: 15000,
+    staleTime: STALE_TIME.USER_DATA,
     gcTime: 5 * 60 * 1000,
     refetchInterval: 30000,
   });
@@ -490,6 +552,7 @@ export const useTotalUserCredits = () => {
     queryFn: async () => {
       if (!publicKey || !pools) return '0';
 
+      const { sorobanService } = await loadSoroban();
       const credits = await Promise.allSettled(
         pools.map(pool => sorobanService.calculateUserCredits(pool.id, publicKey))
       );
@@ -504,7 +567,7 @@ export const useTotalUserCredits = () => {
       return totalCredits.toString();
     },
     enabled: !!publicKey && !!pools && pools.length > 0,
-    staleTime: 10000,
+    staleTime: STALE_TIME.USER_DATA,
     gcTime: 5 * 60 * 1000,
     refetchInterval: 15000,
   });
@@ -566,6 +629,7 @@ export function usePlatformStats(initialData?: UIPlatformStats) {
   return useQuery<UIPlatformStats>({
     queryKey: [QUERY_KEYS.PLATFORM_STATS],
     queryFn: async () => {
+      const { sorobanService } = await loadSoroban();
       const [stats, velocity] = await Promise.all([
         sorobanService.getPlatformStats(),
         sorobanService.getCreditVelocity(24)
@@ -582,7 +646,7 @@ export function usePlatformStats(initialData?: UIPlatformStats) {
         onlineUsers: stats.onlineUsers,
       };
     },
-    staleTime: 60000,        // Keeps data fresh for 1 minute
+    staleTime: STALE_TIME.STATS,   // Keeps data fresh for 1 minute
     gcTime: 5 * 60 * 1000,
     refetchInterval: 120000, // Re-checks the blockchain automatically every 2 minutes
     initialData: initialData
@@ -599,7 +663,7 @@ export function usePlatformStats(initialData?: UIPlatformStats) {
 export function useRpcHealth() {
   const query = useQuery({
     queryKey: ['rpcHealth'],
-    queryFn: () => rpcServer.getHealth(),
+    queryFn: async () => (await loadSoroban()).rpcServer.getHealth(),
     staleTime: 15000,
     gcTime: 5 * 60 * 1000,
     refetchInterval: 30000,

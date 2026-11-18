@@ -48,6 +48,15 @@ export function useLockFlow({
   const [error, setError] = useState<string | null>(null);
   
   // Use refs to avoid recreating execute callback when step or walletApi change during execution
+  const walletApiRef = useRef(walletApi);
+  walletApiRef.current = walletApi;
+  // step changes throughout the flow (idle -> simulating -> signing ->
+  // submitting -> success/error), so depending on it directly recreated
+  // `execute` mid-flow -- a caller holding an earlier reference to `execute`
+  // (e.g. captured in a prop before a re-render propagates) could call a
+  // stale closure whose in-flight guard check below never sees the update
+  // (#396). Reading the current step through a ref keeps that guard live
+  // without making `execute` itself change identity every time step does.
   const stepRef = useRef(step);
   stepRef.current = step;
   const walletApiRef = useRef(walletApi);

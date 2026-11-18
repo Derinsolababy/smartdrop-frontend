@@ -12,7 +12,7 @@ import {
     withRetry
 } from "@/lib/error-handler";
 import { Box, Button, Text, useToast as useChakraToast } from "@chakra-ui/react";
-import { useCallback } from "react";
+import { useCallback, useMemo } from "react";
 
 export type NotificationType = "success" | "error" | "info" | "warning";
 
@@ -28,8 +28,26 @@ const DEFAULT_TOAST_OPTIONS: ToastOptions = {
   position: "bottom-right",
 };
 
+/**
+ * Container style that ensures toasts stack vertically with spacing instead
+ * of overlapping (#596). Chakra's default toast container uses absolute
+ * positioning which can cause overlap at the same position.
+ */
+const TOAST_CONTAINER_STYLE = {
+  maxWidth: "380px",
+  gap: "8px",
+  display: "flex",
+  flexDirection: "column-reverse" as const,
+};
+
 export function useToast() {
   const chakraToast = useChakraToast();
+
+  // Retry button inside the error toast (issues #450 and #478). The toast is a
+  // solid Alert: light mode paints red.600 with white text, dark mode paints
+  // red.200 with near-black text — so its border/hover tint comes from the
+  // app.toastRetryBorder / app.toastRetryHoverBg semantic tokens, which flip
+  // with the color mode instead of hardcoding a whiteAlpha/blackAlpha pair.
 
   /**
    * Show a success notification.
@@ -42,6 +60,7 @@ export function useToast() {
         status: "success",
         ...DEFAULT_TOAST_OPTIONS,
         ...options,
+        containerStyle: TOAST_CONTAINER_STYLE,
       });
     },
     [chakraToast]
@@ -58,6 +77,7 @@ export function useToast() {
         status: "error",
         ...DEFAULT_TOAST_OPTIONS,
         ...options,
+        containerStyle: TOAST_CONTAINER_STYLE,
       });
     },
     [chakraToast]
@@ -74,6 +94,7 @@ export function useToast() {
         status: "info",
         ...DEFAULT_TOAST_OPTIONS,
         ...options,
+        containerStyle: TOAST_CONTAINER_STYLE,
       });
     },
     [chakraToast]
@@ -90,6 +111,7 @@ export function useToast() {
         status: "warning",
         ...DEFAULT_TOAST_OPTIONS,
         ...options,
+        containerStyle: TOAST_CONTAINER_STYLE,
       });
     },
     [chakraToast]
@@ -115,6 +137,7 @@ export function useToast() {
           status: "error",
           ...DEFAULT_TOAST_OPTIONS,
           duration: 8000,
+          containerStyle: TOAST_CONTAINER_STYLE,
           description: (
             <Box>
               <Text>{normalized.userMessage}</Text>
@@ -122,9 +145,9 @@ export function useToast() {
                 size="sm"
                 mt={2}
                 variant="outline"
-                borderColor="whiteAlpha.600"
+                borderColor="app.toastRetryBorder"
                 color="inherit"
-                _hover={{ bg: "whiteAlpha.200" }}
+                _hover={{ bg: "app.toastRetryHoverBg" }}
                 onClick={() => {
                   chakraToast.closeAll();
                   onRetry();
@@ -142,6 +165,7 @@ export function useToast() {
           status: "error",
           ...DEFAULT_TOAST_OPTIONS,
           duration: 6000, // Slightly longer for errors
+          containerStyle: TOAST_CONTAINER_STYLE,
         });
       }
 
@@ -181,6 +205,7 @@ export function useToast() {
             isClosable: false,
             ...DEFAULT_TOAST_OPTIONS,
             ...toastOptions,
+            containerStyle: TOAST_CONTAINER_STYLE,
           })
         : null;
 
@@ -201,6 +226,7 @@ export function useToast() {
             status: "success",
             ...DEFAULT_TOAST_OPTIONS,
             ...toastOptions,
+            containerStyle: TOAST_CONTAINER_STYLE,
           });
         }
 
@@ -217,14 +243,20 @@ export function useToast() {
     [chakraToast, handleError]
   );
 
-  return {
-    success,
-    error,
-    info,
-    warning,
-    handleError,
-    withErrorHandling,
-  };
+  // Memoized so the returned object keeps its identity across renders —
+  // ErrorProvider hands it to every useErrorHandler() consumer via context,
+  // and a fresh object here would re-render all of them on each render.
+  return useMemo(
+    () => ({
+      success,
+      error,
+      info,
+      warning,
+      handleError,
+      withErrorHandling,
+    }),
+    [success, error, info, warning, handleError, withErrorHandling],
+  );
 }
 
 export type UseToastReturn = ReturnType<typeof useToast>;

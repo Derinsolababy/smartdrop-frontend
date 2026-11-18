@@ -4,13 +4,13 @@ import { buildFeeBumpTransaction, sorobanService } from '@/lib/soroban';
 import { networkPassphrase } from '@/config';
 import { assertSponsorableInnerTransaction, feeBumpRateLimiter } from '@/lib/feeBumpGuard';
 
-export async function POST(request: Request) {
+async function handlePost(request: Request) {
   try {
     const sponsorSecret = process.env.STELLAR_FEE_SPONSOR_SECRET;
     if (!sponsorSecret) {
       console.error('[SignFeeBump] Sponsor secret (STELLAR_FEE_SPONSOR_SECRET) is not configured.');
       return NextResponse.json(
-        { error: 'Sponsor secret key is not configured on the server' },
+        { error: 'Fee sponsorship is temporarily unavailable' },
         { status: 500 },
       );
     }
@@ -44,7 +44,7 @@ export async function POST(request: Request) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[SignFeeBump] Invalid sponsor secret key format:', msg);
       return NextResponse.json(
-        { error: 'Invalid sponsor secret key configuration' },
+        { error: 'Fee sponsorship is temporarily unavailable' },
         { status: 500 },
       );
     }
@@ -57,9 +57,12 @@ export async function POST(request: Request) {
         networkPassphrase,
       ) as Transaction;
     } catch (err: unknown) {
+      // Log the SDK error server-side only — the client gets a stable,
+      // generic message so parser internals are never disclosed (#594).
       const msg = err instanceof Error ? err.message : String(err);
+      console.warn('[SignFeeBump] Failed to parse inner transaction XDR:', msg);
       return NextResponse.json(
-        { error: `Invalid inner transaction XDR: ${msg}` },
+        { error: 'Invalid inner transaction XDR' },
         { status: 400 },
       );
     }
@@ -73,7 +76,12 @@ export async function POST(request: Request) {
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn('[SignFeeBump] Rejected non-sponsorable inner transaction:', msg);
-      return NextResponse.json({ error: msg }, { status: 400 });
+      // Do not echo the assertion message: it describes internal policy and
+      // contract topology (#594).
+      return NextResponse.json(
+        { error: 'Transaction is not eligible for fee sponsorship' },
+        { status: 400 },
+      );
     }
 
     // Build the fee-bump transaction
@@ -101,4 +109,21 @@ export async function POST(request: Request) {
       { status: 500 },
     );
   }
+}
+
+// Stamp the Secure flag on every cookie leaving this API route so session
+// cookies are never sent over plain HTTP (#655).
+function withSecureCookies(response: NextResponse): NextResponse {
+  const cookies = response.headers.getSetCookie();
+  if (cookies.length > 0) {
+    response.headers.delete('Set-Cookie');
+    for (const cookie of cookies) {
+      response.headers.append('Set-Cookie', `${cookie}; Secure`);
+    }
+  }
+  return response;
+}
+
+export async function POST(request: Request) {
+  return withSecureCookies(await handlePost(request));
 }
