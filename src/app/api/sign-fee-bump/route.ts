@@ -4,7 +4,7 @@ import { buildFeeBumpTransaction, sorobanService } from '@/lib/soroban';
 import { networkPassphrase } from '@/config';
 import { assertSponsorableInnerTransaction, feeBumpRateLimiter } from '@/lib/feeBumpGuard';
 
-export async function POST(request: Request) {
+async function handlePost(request: Request) {
   try {
     const sponsorSecret = process.env.STELLAR_FEE_SPONSOR_SECRET;
     if (!sponsorSecret) {
@@ -109,4 +109,21 @@ export async function POST(request: Request) {
       { status: 500 },
     );
   }
+}
+
+// Stamp the Secure flag on every cookie leaving this API route so session
+// cookies are never sent over plain HTTP (#655).
+function withSecureCookies(response: NextResponse): NextResponse {
+  const cookies = response.headers.getSetCookie();
+  if (cookies.length > 0) {
+    response.headers.delete('Set-Cookie');
+    for (const cookie of cookies) {
+      response.headers.append('Set-Cookie', `${cookie}; Secure`);
+    }
+  }
+  return response;
+}
+
+export async function POST(request: Request) {
+  return withSecureCookies(await handlePost(request));
 }
